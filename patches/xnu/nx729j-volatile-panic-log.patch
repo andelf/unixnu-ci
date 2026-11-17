@@ -1,0 +1,73 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 433b6cd..a1c2956 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -73,6 +73,9 @@ clock_frequency_info_t gPEClockFrequencyInfo;
+ vm_offset_t gPanicBase = 0;
+ unsigned int gPanicSize;
+ struct embedded_panic_header *panic_info = NULL;
++#if defined(XNU_NX729J_VOLATILE_PANIC_LOG) && XNU_NX729J_VOLATILE_PANIC_LOG
++static uint8_t nx729j_volatile_panic_log[128 * 1024] __attribute__((aligned(4096)));
++#endif
+ 
+ #if (DEVELOPMENT || DEBUG) && defined(XNU_TARGET_OS_BRIDGE)
+ /*
+@@ -523,7 +526,58 @@ PE_create_console(void)
+ 	 * Check the head of VRAM for a panic log saved on last panic.
+ 	 * Do this before the VRAM is trashed.
+ 	 */
++	/*
++	 * nx729j: the loader publishes the GOP geometry but leaves the packed depth
++	 * byte of boot_args->Video at zero, and every console decision downstream is
++	 * gated on v_depth: initialize_screen() reports d=00000000, vc_initialize()
++	 * refuses to map the surface, and the panel keeps the last frame the loader
++	 * drew.  That one zero is why this board has never had a console - every
++	 * diagnostic so far had to travel through a storage write, and the ones that
++	 * raced a stalled command were lost.  The loader has already verified that the
++	 * stride matches a 32-bit direct-colour GOP mode, so a width * 4 stride means
++	 * exactly that surface; adopt it instead of booting blind.
++	 */
++	if (PE_state.video.v_depth == 0 && PE_state.video.v_baseAddr != 0 &&
++	    PE_state.video.v_width >= 320 && PE_state.video.v_height >= 240 &&
++	    PE_state.video.v_rowBytes >= (unsigned long)PE_state.video.v_width * 4) {
++		PE_state.video.v_depth = 32;
++		printf("nx729j: console on frame buffer, %lux%lu, %lu bytes a row, base %p\n",
++		    (unsigned long)PE_state.video.v_width, (unsigned long)PE_state.video.v_height,
++		    (unsigned long)PE_state.video.v_rowBytes, (void *)PE_state.video.v_baseAddr);
++	}
++#if defined(XNU_NX729J_VOLATILE_PANIC_LOG) && XNU_NX729J_VOLATILE_PANIC_LOG
++	/*
++	 * The nx729j device tree has no Apple PRAM reservation, so the standard
++	 * embedded panic machinery would silently drop every panic.  Keep it valid
++	 * with kernel-owned RAM instead; the contents are intentionally volatile and
++	 * never advertised to firmware as persistent.  The *persistent* record is the
++	 * ramoops console mirror in nx729j_ramoops_console.h, which already captured
++	 * the console output (including the panic backtrace) before it happened.
++	 */
++	gPanicBase = (vm_offset_t)nx729j_volatile_panic_log;
++	gPanicSize = sizeof(nx729j_volatile_panic_log);
++	panic_text_len = gPanicSize - sizeof(struct embedded_panic_header);
++	/*
++	 * Everything downstream dereferences this pointer without testing it.
++	 * paniclog_flush() stamps eph_* through it, SavePanicInfo() reads and writes
++	 * the same header, and is_debug_ptr_in_ext_paniclog() reads it once per debug
++	 * byte.  On this board nothing ever assigned it: check_for_panic_log() is the
++	 * only writer and it is precisely the call this branch replaces.  That left
++	 * every panic dying in its own printing path - far=0xa1 in the first boot,
++	 * then far=0x14 and far=0x24 once that one was guarded.
++	 *
++	 * Point it at the head of the same buffer and give it a well-formed header so
++	 * the panic machinery takes its normal path: an all-zero header would still
++	 * pass the magic test with a printf warning.  eph_ext_paniclog_offset stays 0,
++	 * which keeps the ext-paniclog split disabled - there are no handles here.
++	 */
++	panic_info = (struct embedded_panic_header *)gPanicBase;
++	bzero(panic_info, sizeof(struct embedded_panic_header));
++	panic_info->eph_magic = EMBEDDED_PANIC_MAGIC;
++	panic_info->eph_version = EMBEDDED_PANIC_HEADER_CURRENT_VERSION;
++#else
+ 	check_for_panic_log();
++#endif
+ 
+ 	if (PE_state.video.v_display) {
+ 		PE_initialize_console(&PE_state.video, kPEGraphicsMode);
